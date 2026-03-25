@@ -3,14 +3,16 @@ import schedule
 import time
 import json
 import os
-from datetime import datetime, timedelta
+import threading
+from datetime import datetime, timedelta, timezone
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-API_KEY    = "c6ad0124-e930-432d-9af2-c7983987232a"
-API_SECRET = "5LRr5baG5gzdF9pW7LDDFusswDYKyxF1"
-TELEGRAM_BOT_TOKEN = "263996056:AAE-Ys6lh3HdhX8Xc8MJ2W5AgD0hYITzJFo"
-TELEGRAM_CHAT_ID   = "267436315"
-API_BASE               = "https://pool-api.sbicrypto.com"
-STATE_FILE             = "/tmp/worker_state.json"
+API_KEY               = "c6ad0124-e930-432d-9af2-c7983987232a"
+API_SECRET            = "5LRr5baG5gzdF9pW7LDDFusswDYKyxF1"
+TELEGRAM_BOT_TOKEN   = "263996056:AAE-Ys6lh3HdhX8Xc8MJ2W5AgD0hYITzJFo"
+TELEGRAM_CHAT_ID     = "267436315"
+API_BASE              = "https://pool-api.sbicrypto.com"
+STATE_FILE            = "/tmp/worker_state.json"
 CHECK_INTERVAL_MINUTES = 10
 
 HEADERS = {
@@ -19,116 +21,180 @@ HEADERS = {
     "Accept":       "application/json",
 }
 
-def get_worker_counts():
-    try:
-        r = requests.get(f"{API_BASE}/api/external/v1/workers",
-            headers=HEADERS, params={"subaccountNames": "Aerg_BTC"}, timeout=30)
-        if r.status_code == 200:
-            data = r.json()
-            workers = data.get("content", data.get("data", data))
-            if isinstance(workers, list):
-                online   = sum(1 for w in workers if str(w.get("status","")).upper() == "ONLINE")
-                offline  = sum(1 for w in workers if str(w.get("status","")).upper() == "OFFLINE")
-                inactive = sum(1 for w in workers if str(w.get("status","")).upper() == "DEAD")
-                return online, offline, inactive, len(workers)
-    except Exception as e:
-        print(f"  [workers Aerg_BTC] error: {e}")
-    try:
-        r = requests.get(f"{API_BASE}/api/external/v1/workers",
-            headers=HEADERS, timeout=30)
-        if r.status_code == 200:
-            data = r.json()
-            workers = data.get("content", data.get("data", data))
-            if isinstance(workers, list):
-                online   = sum(1 for w in workers if str(w.get("status","")).upper() == "ONLINE")
-                offline  = sum(1 for w in workers if str(w.get("status","")).upper() == "OFFLINE")
-                inactive = sum(1 for w in workers if str(w.get("status","")).upper() == "DEAD")
-                return online, offline, inactive, len(workers)
-    except Exception as e:
-        print(f"  [workers all] error: {e}")
-    try:
-        r = requests.get(f"{API_BASE}/api/external/v1/subaccounts",
-            headers=HEADERS, params={"subaccountNames": "Aerg_BTC"}, timeout=30)
-        if r.status_code == 200:
-            data = r.json()
-            items = data.get("content", data.get("data", data))
-            if isinstance(items, list) and items:
-                acc = items[0]
-                online   = int(acc.get("onlineWorkers",   acc.get("activeWorkerCount",   0)))
-                offline  = int(acc.get("offlineWorkers",  acc.get("inactiveWorkerCount", 0)))
-                inactive = int(acc.get("inactiveWorkers", 0))
-                total    = int(acc.get("totalWorkers",    acc.get("workerCount", online + offline)))
-                return online, offline, inactive, total
-    except Exception as e:
-        print(f"  [subaccounts] error: {e}")
-    raise RuntimeError("Failed to get worker data from any endpoint")
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"BTC Mining Monitor OK")
+    def log_message(self, format, *args):
+        pass
+
+
+def start_http_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"HTTP server listening on port {port}", flush=True)
+    server.serve_forever()
+
 
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=15)
+        r = requests.post(url, json=payload, timeout=15)
+        print(f"Telegram response: {r.status_code} {r.text}", flush=True)
     except Exception as e:
-        print(f"  Telegram error: {e}")
+        print(f"Telegram error: {e}", flush=True)
+
+
+def get_all_workers():
+    workers = []
+    page = 1
+    while True:
+        try:
+            r = requests.get(
+                f"{API_BASE}/api/external/v1/workers",
+                headers=HEADERS,
+                params={"page": page, "size": 100},
+                timeout=30,
+            )
+            print(f"API page {page}: status={r.status_code}", flush=True)
+            if r.status_code != 200:
+                print(f"API error body: {r.text[:500]}", flush=True)
+                break
+            data = r.json()
+            print(f"API page {page} keys: {list(data.keys()) if isinstance(data, dict) else type(data)}", flush=True)
+            # handle different response shapes
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get("data") or data.get("workers") or data.get("items") or data.get("list") or []
+                if not isinstance(items, list):
+                    # maybe the dict itself is one worker
+                    items = [data]
+            else:
+                items = []
+            print(f"API page {page}: {len(items)} items", flush=True)
+            workers.extend(items)
+            # pagination
+            total = None
+            if isinstance(data, dict):
+                total = data.get("total") or data.get("totalCount") or data.get("count")
+            if total is None or len(workers) >= total or len(items) < 100:
+                break
+            page += 1
+        except Exception as e:
+            print(f"Worker fetch error: {e}", flush=True)
+            break
+    return workers
+
+
+def count_online(workers):
+    online = 0
+    for w in workers:
+        status = str(w.get("status", "") or w.get("workerStatus", "") or "").lower()
+        if status in ("online", "active", "1", "true"):
+            online += 1
+    return online
+
 
 def load_state():
     if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    return {"history": []}
+        try:
+            with open(STATE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
 
 def save_state(state):
     with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+        json.dump(state, f)
 
-def get_value_24h_ago(history):
-    threshold = datetime.utcnow() - timedelta(hours=24)
-    candidates = [e for e in history if datetime.fromisoformat(e["ts"]) <= threshold]
-    return candidates[-1]["online"] if candidates else None
 
 def check():
-    now_str = datetime.utcnow().isoformat()
-    now_fmt = datetime.utcnow().strftime("%Y-%m-%d %H:%M") + " UTC"
+    now = datetime.now(timezone.utc)
+    now_fmt = now.strftime("%Y-%m-%d %H:%M") + " UTC"
     print(f"[{now_fmt}] Checking workers...", flush=True)
-    try:
-        online, offline, inactive, total = get_worker_counts()
-    except Exception as e:
-        msg = f"\u26a0\ufe0f <b>BTC Mining Monitor - Error!</b>\n\U0001f550 {now_fmt}\n<code>{e}</code>"
-        send_telegram(msg)
-        print(f"  ERROR: {e}", flush=True)
-        return
+
+    workers = get_all_workers()
+    total = len(workers)
+    online = count_online(workers)
+    print(f"Total workers: {total}  Online: {online}", flush=True)
+
+    # Send raw sample for debug
+    sample = json.dumps(workers[:2], ensure_ascii=False)[:400] if workers else "[]"
+    print(f"Sample: {sample}", flush=True)
+
     state = load_state()
-    history = state["history"]
-    online_24h = get_value_24h_ago(history)
-    history.append({"ts": now_str, "online": online, "offline": offline, "inactive": inactive})
-    state["history"] = history[-300:]
+    threshold = now - timedelta(hours=24)
+
+    # find online count 24h ago
+    history = state.get("history", [])
+    online_24h = None
+    for entry in reversed(history):
+        if datetime.fromisoformat(entry["ts"]) <= threshold:
+            online_24h = entry["online"]
+            break
+
+    # append current
+    history.append({"ts": now.isoformat(), "online": online})
+    # keep only last 48h
+    cutoff = (now - timedelta(hours=48)).isoformat()
+    history = [e for e in history if e["ts"] >= cutoff]
+    state["history"] = history
     save_state(state)
-    print(f"  Online: {online}  Offline: {offline}  Dead: {inactive}  | 24h ago: {online_24h}", flush=True)
-    if online_24h is not None and online != online_24h:
-        diff  = online - online_24h
-        arrow = "\U0001f4c8" if diff > 0 else "\U0001f4c9"
+
+    print(f"Online: {online}  Online 24h ago: {online_24h}", flush=True)
+
+    if online_24h is None:
         msg = (
-            f"{arrow} <b>BTC Mining - Worker Change!</b>\n\n"
-            f"\U0001f550 {now_fmt}\n"
-            f"\U0001f7e2 Online now:  <b>{online}</b>\n"
-            f"\U0001f534 Offline now: <b>{offline}</b>\n"
-            f"\u26ab Dead/Inactive: <b>{inactive}</b>\n\n"
-            f"\U0001f4c5 Online 24h ago: <b>{online_24h}</b>\n"
-            f"\U0001f4ca Change: <b>{diff:+d} workers</b>\n\n"
-            f"\U0001f517 <a href='https://pool.sbicrypto.com/dashboard'>Open Dashboard</a>"
+            f"\U0001f680 <b>BTC Mining Monitor</b>\n\n"
+            f"\U0001f4ca First check completed\n"
+            f"\U0001f4c5 Time: <b>{now_fmt}</b>\n"
+            f"\U0001f4bb Total workers: <b>{total}</b>\n"
+            f"\U0001f7e2 Online now: <b>{online}</b>\n"
+            f"\u26a0\ufe0f No 24h baseline yet, will alert on next change.\n\n"
+            f"\U0001f517 <a href='https://pool.sbicrypto.com/dashboard'>Dashboard</a>"
         )
         send_telegram(msg)
-        print(f"  Notification sent (change: {diff:+d})", flush=True)
+        return
+
+    diff = online - online_24h
+    if diff != 0:
+        direction = "\U0001f4c8 increased" if diff > 0 else "\U0001f4c9 decreased"
+        msg = (
+            f"\u26a0\ufe0f <b>Worker count changed!</b>\n\n"
+            f"\U0001f4c5 Time: <b>{now_fmt}</b>\n"
+            f"\U0001f7e2 Online now: <b>{online}</b>\n"
+            f"\U0001f4c6 Online 24h ago: <b>{online_24h}</b>\n"
+            f"\U0001f4ca {direction} by <b>{abs(diff)}</b> workers\n\n"
+            f"\U0001f517 <a href='https://pool.sbicrypto.com/dashboard'>Dashboard</a>"
+        )
+        send_telegram(msg)
+        print(f"Notification sent (change: {diff:+d})", flush=True)
     else:
-        print("  No change.", flush=True)
+        print(" No change.", flush=True)
+
 
 if __name__ == "__main__":
-    print("BTC Mining Monitor started", flush=True)
+    print("BTC Mining Monitor v3 started", flush=True)
+    t = threading.Thread(target=start_http_server, daemon=True)
+    t.start()
+    time.sleep(2)
     send_telegram(
-        "\U0001f680 <b>BTC Mining Monitor started</b>\n\n"
-        f"\u26cf Subaccount: Aerg_BTC\n"
+        "\U0001f680 <b>BTC Mining Monitor v3 started</b>\n\n"
+        "\u26cf Subaccount: Aerg_BTC\n"
         f"\U0001f501 Check every {CHECK_INTERVAL_MINUTES} min\n"
-        f"\U0001f514 Alert on worker count change vs 24h ago\n\n"
-        f"\U0001f517 <a href='https://pool.sbicrypto.com/dashboard'>Dashboard</a>"
+        "\U0001f514 Alert on worker count change vs 24h ago\n\n"
+        "\U0001f517 <a href='https://pool.sbicrypto.com/dashboard'>Dashboard</a>"
     )
     check()
     schedule.every(CHECK_INTERVAL_MINUTES).minutes.do(check)
